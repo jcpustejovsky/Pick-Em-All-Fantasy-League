@@ -1,0 +1,624 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Pick Anyone — Fantasy Football</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  tailwind.config = {
+    theme: {
+      extend: {
+        colors: {
+          turf: '#1E3D2F',
+          turfdeep: '#152D22',
+          chalk: '#FAF9F4',
+          paper: '#F0EEE5',
+          gold: '#D9A62E',
+          brick: '#9B4038',
+          line: '#D8D4C6',
+        }
+      }
+    }
+  }
+</script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  .ff-num { font-variant-numeric: tabular-nums; font-weight: 800; letter-spacing: -0.02em; }
+  .ff-row:nth-child(even) { background: #F0EEE5; }
+</style>
+</head>
+<body class="bg-paper text-turfdeep min-h-screen">
+<div id="app" class="min-h-screen">
+  <div class="p-8 text-center text-turfdeep">Loading…</div>
+</div>
+
+<script>
+// ====================================================================
+// CONFIG — fill these in from Supabase: Project Settings > API
+// ====================================================================
+const SUPABASE_URL = "https://kofzybyyyasjakvioena.supabase.co";
+const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtvZnp5Ynl5eWFzamFrdmlvZW5hIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODkwNzU1MTcsImV4cCI6MjEwNDY1MTUxN30.9V0cyPf22JUaQVwz6OYrGRzDp9uS1iM2lfGeGnNMxzU";
+
+const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+const ROSTER_SIZE = 13;
+const POSITIONS = ["QB", "RB", "WR", "TE", "K"];
+
+// ====================================================================
+// STATE
+// ====================================================================
+let state = {
+  loading: true,
+  session: null,
+  profile: null,
+  players: [],
+  profiles: [],
+  meta: { current_week: 1 },
+  picksRows: [],
+  pointsRows: [],
+  tab: "picks",
+  viewWeek: 1,
+  lineupManagerId: null,
+  search: "",
+  posFilter: "ALL",
+  adminWeek: 1,
+  authMode: "signin",
+  authError: "",
+  busy: false,
+};
+
+function setState(patch) {
+  state = { ...state, ...patch };
+  render();
+}
+
+// ====================================================================
+// DATA HELPERS (pure)
+// ====================================================================
+function picksFor(week, userId) {
+  return state.picksRows
+    .filter((r) => r.week === week && r.user_id === userId)
+    .map((r) => r.player_id);
+}
+
+function pointsMapFor(week) {
+  const map = {};
+  state.pointsRows
+    .filter((r) => r.week === week)
+    .forEach((r) => (map[r.player_id] = Number(r.points)));
+  return map;
+}
+
+function computeLineup(pickIds, pointsMap) {
+  const byId = Object.fromEntries(state.players.map((p) => [p.id, p]));
+  const pool = (pickIds || [])
+    .map((id) => byId[id] && { ...byId[id], pts: pointsMap[id] ?? 0 })
+    .filter(Boolean);
+  const used = new Set();
+  const takeTop = (posList, count) => {
+    const cands = pool
+      .filter((p) => posList.includes(p.pos) && !used.has(p.id))
+      .sort((a, b) => b.pts - a.pts);
+    const chosen = cands.slice(0, count);
+    chosen.forEach((c) => used.add(c.id));
+    return chosen;
+  };
+  const QB = takeTop(["QB"], 1);
+  const RB = takeTop(["RB"], 2);
+  const WR = takeTop(["WR"], 2);
+  const TE = takeTop(["TE"], 1);
+  const K = takeTop(["K"], 1);
+  const FLEX = takeTop(["RB", "WR", "TE"], 1);
+  const starters = [...QB, ...RB, ...WR, ...TE, ...FLEX, ...K];
+  const bench = pool.filter((p) => !used.has(p.id));
+  const total = starters.reduce((s, p) => s + p.pts, 0);
+  return { QB, RB, WR, TE, FLEX, K, bench, total };
+}
+
+function computeStandings(uptoWeek) {
+  const totals = {};
+  state.profiles.forEach((m) => (totals[m.id] = { w: 0, l: 0, t: 0, pts: 0 }));
+  for (let wk = 1; wk <= uptoWeek; wk++) {
+    const weekPoints = pointsMapFor(wk);
+    if (Object.keys(weekPoints).length === 0) continue;
+    const scores = state.profiles.map((m) => ({
+      id: m.id,
+      total: computeLineup(picksFor(wk, m.id), weekPoints).total,
+    }));
+    const sorted = [...scores].sort((a, b) => b.total - a.total);
+    const n = sorted.length;
+    if (n === 0) continue;
+    const mid = n / 2;
+    const median =
+      n % 2 === 0 ? (sorted[mid - 1].total + sorted[mid].total) / 2 : sorted[Math.floor(mid)].total;
+    scores.forEach((s) => {
+      totals[s.id].pts += s.total;
+      if (s.total > median) totals[s.id].w++;
+      else if (s.total < median) totals[s.id].l++;
+      else totals[s.id].t++;
+    });
+  }
+  return totals;
+}
+
+function escapeHtml(str) {
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+// ====================================================================
+// DATA LOADING
+// ====================================================================
+async function loadAll() {
+  const [playersRes, profilesRes, metaRes, picksRes, pointsRes] = await Promise.all([
+    sb.from("players").select("*"),
+    sb.from("profiles").select("*"),
+    sb.from("league_meta").select("*").eq("id", 1).maybeSingle(),
+    sb.from("picks").select("*"),
+    sb.from("weekly_points").select("*"),
+  ]);
+  setState({
+    players: playersRes.data || [],
+    profiles: profilesRes.data || [],
+    meta: metaRes.data || { current_week: 1 },
+    picksRows: picksRes.data || [],
+    pointsRows: pointsRes.data || [],
+    viewWeek: (metaRes.data && metaRes.data.current_week) || 1,
+    adminWeek: (metaRes.data && metaRes.data.current_week) || 1,
+    lineupManagerId: state.lineupManagerId || (state.session && state.session.user.id),
+  });
+}
+
+async function refreshSession() {
+  const { data } = await sb.auth.getSession();
+  const session = data.session;
+  let profile = null;
+  if (session) {
+    const { data: p } = await sb.from("profiles").select("*").eq("id", session.user.id).maybeSingle();
+    profile = p;
+  }
+  setState({ session, profile, loading: false, authError: "" });
+  if (session) await loadAll();
+}
+
+// ====================================================================
+// AUTH ACTIONS
+// ====================================================================
+async function doSignUp(email, password, teamName) {
+  setState({ busy: true, authError: "" });
+  const { data, error } = await sb.auth.signUp({ email, password });
+  if (error) {
+    setState({ busy: false, authError: error.message });
+    return;
+  }
+  if (!data.session) {
+    setState({
+      busy: false,
+      authError:
+        "Account created, but no session was returned. Make sure 'Enable email confirmations' is turned OFF in Supabase Auth settings, then try signing in.",
+    });
+    return;
+  }
+  const { error: profileError } = await sb.from("profiles").insert({
+    id: data.user.id,
+    team_name: teamName || "New Team",
+  });
+  if (profileError) {
+    setState({ busy: false, authError: "Signed up, but couldn't create your team profile: " + profileError.message });
+    return;
+  }
+  setState({ busy: false });
+  await refreshSession();
+}
+
+async function doSignIn(email, password) {
+  setState({ busy: true, authError: "" });
+  const { error } = await sb.auth.signInWithPassword({ email, password });
+  if (error) {
+    setState({ busy: false, authError: error.message });
+    return;
+  }
+  setState({ busy: false });
+  await refreshSession();
+}
+
+async function doSignOut() {
+  await sb.auth.signOut();
+  setState({
+    session: null,
+    profile: null,
+    players: [],
+    profiles: [],
+    picksRows: [],
+    pointsRows: [],
+  });
+}
+
+// ====================================================================
+// WRITE ACTIONS
+// ====================================================================
+async function togglePick(playerId) {
+  const week = state.viewWeek;
+  const uid = state.session.user.id;
+  const mine = picksFor(week, uid);
+  setState({ busy: true });
+  if (mine.includes(playerId)) {
+    await sb.from("picks").delete().eq("user_id", uid).eq("week", week).eq("player_id", playerId);
+  } else {
+    if (mine.length >= ROSTER_SIZE) {
+      setState({ busy: false });
+      return;
+    }
+    await sb.from("picks").insert({ user_id: uid, week, player_id: playerId });
+  }
+  const { data } = await sb.from("picks").select("*");
+  setState({ picksRows: data || [], busy: false });
+}
+
+async function commitPoints(week, playerId, value) {
+  const points = value === "" ? 0 : parseFloat(value);
+  if (isNaN(points)) return;
+  await sb.from("weekly_points").upsert({ player_id: playerId, week, points });
+  const { data } = await sb.from("weekly_points").select("*");
+  setState({ pointsRows: data || [] });
+}
+
+async function commitCurrentWeek(value) {
+  const n = parseInt(value);
+  if (isNaN(n) || n < 1) return;
+  await sb.from("league_meta").update({ current_week: n }).eq("id", 1);
+  const { data } = await sb.from("league_meta").select("*").eq("id", 1).maybeSingle();
+  setState({ meta: data || state.meta });
+}
+
+// ====================================================================
+// RENDER
+// ====================================================================
+function render() {
+  const active = document.activeElement;
+  const activeId = active && active.id;
+  const selStart = active && "selectionStart" in active ? active.selectionStart : null;
+
+  const app = document.getElementById("app");
+  if (state.loading) {
+    app.innerHTML = `<div class="p-8 text-center">Loading…</div>`;
+    return;
+  }
+  app.innerHTML = state.session ? renderApp() : renderAuth();
+
+  if (activeId) {
+    const el = document.getElementById(activeId);
+    if (el) {
+      el.focus();
+      if (selStart !== null && "setSelectionRange" in el) {
+        try { el.setSelectionRange(selStart, selStart); } catch (e) {}
+      }
+    }
+  }
+}
+
+function renderAuth() {
+  const err = state.authError
+    ? `<div class="bg-brick text-chalk text-sm px-3 py-2 rounded mb-3">${escapeHtml(state.authError)}</div>`
+    : "";
+  const isSignup = state.authMode === "signup";
+  return `
+    <div class="bg-turf text-chalk px-4 py-6 text-center">
+      <div class="text-2xl font-bold">Pick Anyone</div>
+      <div class="text-sm opacity-80">Non-exclusive weekly best-ball fantasy football</div>
+    </div>
+    <div class="max-w-sm mx-auto p-4 mt-6">
+      <div class="bg-chalk border border-line rounded-lg p-4">
+        <div class="flex gap-2 mb-4">
+          <button data-action="auth-mode" data-mode="signin"
+            class="flex-1 px-3 py-2 rounded text-sm font-semibold ${!isSignup ? "bg-turf text-chalk" : "border border-line"}">
+            Sign in
+          </button>
+          <button data-action="auth-mode" data-mode="signup"
+            class="flex-1 px-3 py-2 rounded text-sm font-semibold ${isSignup ? "bg-turf text-chalk" : "border border-line"}">
+            Create account
+          </button>
+        </div>
+        ${err}
+        ${isSignup ? `
+          <label class="block text-xs font-semibold mb-1">Team name</label>
+          <input id="signup-team" type="text" placeholder="e.g. Sunday Scaries"
+            class="w-full border border-line rounded px-3 py-2 text-sm mb-3" />
+        ` : ""}
+        <label class="block text-xs font-semibold mb-1">Email</label>
+        <input id="auth-email" type="email" placeholder="you@example.com"
+          class="w-full border border-line rounded px-3 py-2 text-sm mb-3" />
+        <label class="block text-xs font-semibold mb-1">Password</label>
+        <input id="auth-password" type="password" placeholder="At least 6 characters"
+          class="w-full border border-line rounded px-3 py-2 text-sm mb-4" />
+        <button data-action="${isSignup ? "signup" : "signin"}"
+          ${state.busy ? "disabled" : ""}
+          class="w-full bg-turf text-chalk font-semibold py-2 rounded hover:bg-turfdeep disabled:opacity-50">
+          ${state.busy ? "Working…" : isSignup ? "Create account" : "Sign in"}
+        </button>
+      </div>
+    </div>
+  `;
+}
+
+function renderApp() {
+  const myId = state.session.user.id;
+  const myManager = state.profile;
+
+  const tabs = [
+    ["picks", "My Picks"],
+    ["lineup", "Lineup"],
+    ["standings", "Standings"],
+  ];
+  if (myManager && myManager.is_commissioner) tabs.push(["admin", "Commissioner"]);
+
+  const header = `
+    <div class="bg-turf text-chalk px-4 py-4">
+      <div class="flex items-center justify-between flex-wrap gap-2">
+        <div>
+          <div class="text-xl font-bold">Pick Anyone</div>
+          <div class="text-sm opacity-80">Week ${state.meta.current_week}</div>
+        </div>
+        <div class="flex items-center gap-3">
+          <div class="text-right">
+            <div class="text-xs opacity-70">Playing as</div>
+            <div class="font-semibold">${escapeHtml((myManager && myManager.team_name) || "…")}</div>
+          </div>
+          <button data-action="signout" class="text-xs px-3 py-1 rounded border border-chalk">Sign out</button>
+        </div>
+      </div>
+    </div>
+  `;
+
+  const tabBar = `
+    <div class="flex gap-2 px-4 pt-4 flex-wrap">
+      ${tabs.map(([key, label]) => `
+        <button data-action="tab" data-tab="${key}"
+          class="px-4 py-2 rounded-t-lg text-sm font-semibold border border-line ${state.tab === key ? "bg-turf text-chalk border-turf" : "bg-chalk"}">
+          ${label}
+        </button>
+      `).join("")}
+    </div>
+  `;
+
+  let body = "";
+  if (state.tab === "picks") body = renderPicksTab(myId);
+  else if (state.tab === "lineup") body = renderLineupTab();
+  else if (state.tab === "standings") body = renderStandingsTab();
+  else if (state.tab === "admin") body = renderAdminTab();
+
+  return header + tabBar + `<div class="p-4">${body}</div>`;
+}
+
+function filteredPlayers() {
+  return state.players.filter((p) => {
+    if (state.posFilter !== "ALL" && p.pos !== state.posFilter) return false;
+    if (state.search && !p.name.toLowerCase().includes(state.search.toLowerCase())) return false;
+    return true;
+  });
+}
+
+function posFilterBar() {
+  return `
+    <div class="flex gap-2 mb-3 flex-wrap">
+      ${["ALL", ...POSITIONS].map((pos) => `
+        <button data-action="pos-filter" data-pos="${pos}"
+          class="text-xs px-3 py-1 rounded-full border border-line ${state.posFilter === pos ? "bg-gold border-gold text-turfdeep" : "bg-white"}">
+          ${pos}
+        </button>
+      `).join("")}
+    </div>
+  `;
+}
+
+function renderPicksTab(myId) {
+  const mine = picksFor(state.viewWeek, myId);
+  return `
+    <div class="bg-chalk border border-line rounded-lg p-4">
+      <div class="flex items-center justify-between flex-wrap gap-2 mb-3">
+        <div class="font-semibold">
+          Week ${state.viewWeek} picks —
+          <span class="${mine.length >= ROSTER_SIZE ? "text-turf" : "text-brick"}">${mine.length}/${ROSTER_SIZE}</span>
+        </div>
+        <input id="search-input" type="text" value="${escapeHtml(state.search)}" data-bind="search"
+          placeholder="Search players…" class="border border-line rounded px-3 py-1 text-sm" />
+      </div>
+      ${posFilterBar()}
+      <div class="max-h-[28rem] overflow-y-auto space-y-1">
+        ${filteredPlayers().map((p) => {
+          const picked = mine.includes(p.id);
+          const disabled = !picked && mine.length >= ROSTER_SIZE;
+          return `
+            <div class="ff-row flex items-center justify-between px-3 py-2 rounded">
+              <div class="flex items-center gap-3 min-w-0">
+                <span class="text-xs font-bold px-2 py-1 rounded bg-turf text-chalk" style="min-width:34px;text-align:center">${p.pos}</span>
+                <div class="min-w-0">
+                  <div class="font-semibold truncate">${escapeHtml(p.name)}</div>
+                  <div class="text-xs text-gray-500">${escapeHtml(p.team)}</div>
+                </div>
+              </div>
+              <button data-action="toggle-pick" data-id="${p.id}" ${disabled ? "disabled" : ""}
+                class="text-xs px-3 py-1 rounded flex-shrink-0 ${picked ? "bg-turf text-chalk" : "border border-turf text-turf"} ${disabled ? "opacity-40" : ""}">
+                ${picked ? "Remove" : "Add"}
+              </button>
+            </div>
+          `;
+        }).join("")}
+      </div>
+    </div>
+  `;
+}
+
+function slotBlock(label, players) {
+  return `
+    <div class="bg-chalk border border-line rounded-lg p-3">
+      <div class="text-gray-500 text-xs uppercase mb-1">${label}</div>
+      ${players.length === 0 ? `<div class="text-sm text-gray-400 italic">empty</div>` : players.map((p) => `
+        <div class="flex items-center justify-between py-1">
+          <div class="text-sm"><span class="font-semibold">${escapeHtml(p.name)}</span> <span class="text-gray-500">${escapeHtml(p.team)}</span></div>
+          <div class="ff-num text-lg text-turf">${p.pts.toFixed(1)}</div>
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
+
+function renderLineupTab() {
+  const weekOptions = Array.from({ length: state.meta.current_week }, (_, i) => i + 1);
+  const lineup = computeLineup(picksFor(state.viewWeek, state.lineupManagerId), pointsMapFor(state.viewWeek));
+  return `
+    <div class="flex items-center gap-3 mb-4 flex-wrap">
+      <select data-bind="view-week" class="border border-line rounded px-2 py-1 text-sm">
+        ${weekOptions.map((w) => `<option value="${w}" ${w === state.viewWeek ? "selected" : ""}>Week ${w}</option>`).join("")}
+      </select>
+      <select data-bind="lineup-manager" class="border border-line rounded px-2 py-1 text-sm">
+        ${state.profiles.map((m) => `<option value="${m.id}" ${m.id === state.lineupManagerId ? "selected" : ""}>${escapeHtml(m.team_name)}</option>`).join("")}
+      </select>
+      <div class="ml-auto ff-num text-2xl text-turf">${lineup.total.toFixed(1)} pts</div>
+    </div>
+    <div class="grid gap-3" style="grid-template-columns: repeat(auto-fill, minmax(180px, 1fr))">
+      ${slotBlock("QB", lineup.QB)}
+      ${slotBlock("RB", lineup.RB)}
+      ${slotBlock("WR", lineup.WR)}
+      ${slotBlock("TE", lineup.TE)}
+      ${slotBlock("Flex", lineup.FLEX)}
+      ${slotBlock("K", lineup.K)}
+    </div>
+    <div class="bg-chalk border border-line rounded-lg p-3 mt-3">
+      <div class="text-gray-500 text-xs uppercase mb-1">Bench (not scored)</div>
+      ${lineup.bench.length === 0 ? `<div class="text-sm text-gray-400 italic">none</div>` : lineup.bench.map((p) => `
+        <div class="flex justify-between text-sm py-1 text-gray-500">
+          <span>${escapeHtml(p.name)} (${p.pos}, ${escapeHtml(p.team)})</span>
+          <span class="ff-num">${p.pts.toFixed(1)}</span>
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
+
+function renderStandingsTab() {
+  const standings = computeStandings(state.meta.current_week);
+  const rows = state.profiles
+    .map((m) => ({ ...m, ...standings[m.id] }))
+    .sort((a, b) => b.w - a.w || b.pts - a.pts);
+  return `
+    <div class="bg-chalk border border-line rounded-lg overflow-hidden">
+      <table class="w-full text-sm">
+        <thead>
+          <tr class="bg-turf text-chalk">
+            <th class="text-left px-3 py-2">Team</th>
+            <th class="px-3 py-2">W</th>
+            <th class="px-3 py-2">L</th>
+            <th class="px-3 py-2">T</th>
+            <th class="px-3 py-2">Total Pts</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows.map((r) => `
+            <tr class="ff-row">
+              <td class="px-3 py-2 font-semibold">${escapeHtml(r.team_name)}</td>
+              <td class="text-center ff-num">${r.w}</td>
+              <td class="text-center ff-num">${r.l}</td>
+              <td class="text-center ff-num">${r.t}</td>
+              <td class="text-center ff-num">${(r.pts || 0).toFixed(1)}</td>
+            </tr>
+          `).join("")}
+        </tbody>
+      </table>
+      <div class="text-xs text-gray-500 p-3">
+        Win = above the week's median score, loss = below, tie = exactly at it. Only weeks with points entered count.
+      </div>
+    </div>
+  `;
+}
+
+function renderAdminTab() {
+  return `
+    <div class="bg-chalk border border-line rounded-lg p-4">
+      <div class="text-sm text-gray-600 mb-3">
+        Enter each player's fantasy points for the week. Changes save when you leave the field (press Tab or click elsewhere).
+      </div>
+      <div class="flex items-center gap-3 mb-3 flex-wrap">
+        <label class="text-sm font-semibold">Current week:</label>
+        <input type="number" min="1" value="${state.meta.current_week}" data-bind="current-week"
+          class="border border-line rounded px-2 py-1 w-20 text-sm" />
+        <label class="text-sm font-semibold ml-4">Entering points for week:</label>
+        <input type="number" min="1" value="${state.adminWeek}" data-bind="admin-week"
+          class="border border-line rounded px-2 py-1 w-20 text-sm" />
+      </div>
+      ${posFilterBar()}
+      <input id="search-input" type="text" value="${escapeHtml(state.search)}" data-bind="search"
+        placeholder="Search players…" class="border border-line rounded px-3 py-1 text-sm mb-3" />
+      <div class="max-h-[28rem] overflow-y-auto space-y-1">
+        ${filteredPlayers().map((p) => {
+          const val = pointsMapFor(state.adminWeek)[p.id];
+          return `
+            <div class="ff-row flex items-center justify-between px-3 py-2 rounded">
+              <div class="flex items-center gap-3 min-w-0">
+                <span class="text-xs font-bold px-2 py-1 rounded bg-turf text-chalk" style="min-width:34px;text-align:center">${p.pos}</span>
+                <div class="min-w-0">
+                  <div class="font-semibold truncate">${escapeHtml(p.name)}</div>
+                  <div class="text-xs text-gray-500">${escapeHtml(p.team)}</div>
+                </div>
+              </div>
+              <input type="number" step="0.1" data-bind="points" data-player-id="${p.id}"
+                value="${val === undefined ? "" : val}" placeholder="0.0"
+                class="border border-line rounded px-2 py-1 w-20 text-sm text-right" />
+            </div>
+          `;
+        }).join("")}
+      </div>
+    </div>
+  `;
+}
+
+// ====================================================================
+// EVENT DELEGATION
+// ====================================================================
+document.body.addEventListener("click", (e) => {
+  const el = e.target.closest("[data-action]");
+  if (!el) return;
+  const action = el.dataset.action;
+
+  if (action === "auth-mode") setState({ authMode: el.dataset.mode, authError: "" });
+  if (action === "signin") {
+    doSignIn(document.getElementById("auth-email").value, document.getElementById("auth-password").value);
+  }
+  if (action === "signup") {
+    doSignUp(
+      document.getElementById("auth-email").value,
+      document.getElementById("auth-password").value,
+      document.getElementById("signup-team").value
+    );
+  }
+  if (action === "signout") doSignOut();
+  if (action === "tab") setState({ tab: el.dataset.tab });
+  if (action === "pos-filter") setState({ posFilter: el.dataset.pos });
+  if (action === "toggle-pick") togglePick(el.dataset.id);
+});
+
+document.body.addEventListener("input", (e) => {
+  if (e.target.dataset.bind === "search") setState({ search: e.target.value });
+});
+
+document.body.addEventListener("change", (e) => {
+  const el = e.target;
+  if (el.dataset.bind === "view-week") setState({ viewWeek: parseInt(el.value) });
+  if (el.dataset.bind === "lineup-manager") setState({ lineupManagerId: el.value });
+  if (el.dataset.bind === "admin-week") setState({ adminWeek: parseInt(el.value) || 1 });
+  if (el.dataset.bind === "current-week") commitCurrentWeek(el.value);
+  if (el.dataset.bind === "points") commitPoints(state.adminWeek, el.dataset.playerId, el.value);
+});
+
+// ====================================================================
+// INIT
+// ====================================================================
+refreshSession();
+</script>
+</body>
+</html>
