@@ -117,20 +117,38 @@ def fetch_csv(url, label):
 # ----------------------------------------------------------------
 # Projections (optional - see module docstring)
 # ----------------------------------------------------------------
+_SLEEPER_MAP_CACHE = None
+
+
+def sleeper_player_map():
+    """
+    {sleeper_id: gsis_id}, fetched at most once per run.
+
+    Sleeper's docs ask callers to hit this endpoint sparingly (it returns
+    every player in the league and is a large download), so this is
+    cached rather than re-fetched for each week.
+    """
+    global _SLEEPER_MAP_CACHE
+    if _SLEEPER_MAP_CACHE is not None:
+        return _SLEEPER_MAP_CACHE
+
+    log("Fetching Sleeper player map (once per run)...")
+    pr = requests.get(SLEEPER_PLAYERS, timeout=180)
+    pr.raise_for_status()
+    mapping = {}
+    for sid, info in (pr.json() or {}).items():
+        gsis = (info or {}).get("gsis_id")
+        if gsis:
+            mapping[str(sid)] = gsis.strip()
+    log(f"  mapped {len(mapping)} Sleeper players to NFL IDs")
+    _SLEEPER_MAP_CACHE = mapping
+    return mapping
+
+
 def fetch_projections(week, scoring_field):
     """Return {gsis_id: projected_points}, or {} if unavailable."""
     try:
-        log("Fetching Sleeper player map...")
-        pr = requests.get(SLEEPER_PLAYERS, timeout=180)
-        pr.raise_for_status()
-        sleeper_players = pr.json()
-
-        sleeper_to_gsis = {}
-        for sid, info in sleeper_players.items():
-            gsis = (info or {}).get("gsis_id")
-            if gsis:
-                sleeper_to_gsis[str(sid)] = gsis.strip()
-        log(f"  mapped {len(sleeper_to_gsis)} Sleeper players to NFL IDs")
+        sleeper_to_gsis = sleeper_player_map()
 
         log(f"Fetching Sleeper projections for week {week}...")
         r = requests.get(

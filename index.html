@@ -159,6 +159,9 @@ function computeStandings(uptoWeek) {
   for (let wk = 1; wk <= uptoWeek; wk++) {
     const weekPoints = pointsMapFor(wk);
     if (Object.keys(weekPoints).length === 0) continue;
+    // A week nobody picked in isn't a week that was played — without this,
+    // weeks before the league started would tie every team at zero.
+    if (!state.picksRows.some((r) => r.week === wk)) continue;
     const scores = state.profiles.map((m) => ({
       id: m.id,
       total: computeRoster(picksFor(wk, m.id), weekPoints).total,
