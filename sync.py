@@ -29,7 +29,9 @@ Projections: Sleeper's projections endpoint. This endpoint is NOT in
 import csv
 import io
 import os
+import re
 import sys
+import unicodedata
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -151,16 +153,37 @@ def fetch_csv(url, label):
 # ----------------------------------------------------------------
 # Projections (optional - see module docstring)
 # ----------------------------------------------------------------
+def norm_name(n):
+    """
+    Normalize a player name for matching across data sources.
+    Handles accents, suffixes (Jr./III), periods (D.J. vs DJ) and
+    apostrophes (O'Connell).
+    """
+    if not n:
+        return ""
+    n = unicodedata.normalize("NFKD", n)
+    n = "".join(c for c in n if not unicodedata.combining(c))
+    n = n.lower()
+    n = re.sub(r"[.'`]", "", n)
+    n = re.sub(r"[^a-z ]", " ", n)
+    parts = [p for p in n.split() if p not in ("jr", "sr", "ii", "iii", "iv", "v")]
+    return " ".join(parts)
+
+
 _SLEEPER_MAP_CACHE = None
 
 
 def sleeper_player_map():
     """
-    {sleeper_id: gsis_id}, fetched at most once per run.
+    {sleeper_id: {"gsis": ..., "name": ..., "team": ...}}, fetched at
+    most once per run.
 
     Sleeper's docs ask callers to hit this endpoint sparingly (it returns
     every player in the league and is a large download), so this is
     cached rather than re-fetched for each week.
+
+    Name and team are kept because a large share of Sleeper records have
+    no gsis_id — name matching is the fallback that recovers them.
     """
     global _SLEEPER_MAP_CACHE
     if _SLEEPER_MAP_CACHE is not None:
@@ -170,19 +193,53 @@ def sleeper_player_map():
     pr = requests.get(SLEEPER_PLAYERS, timeout=180)
     pr.raise_for_status()
     mapping = {}
+    with_gsis = 0
     for sid, info in (pr.json() or {}).items():
-        gsis = (info or {}).get("gsis_id")
+        if not isinstance(info, dict):
+            continue
+        gsis = (info.get("gsis_id") or "").strip()
+        name = info.get("full_name") or " ".join(
+            x for x in (info.get("first_name"), info.get("last_name")) if x
+        )
+        mapping[str(sid)] = {
+            "gsis": gsis or None,
+            "name": norm_name(name),
+            "team": norm_team((info.get("team") or "").strip().upper()),
+        }
         if gsis:
-            mapping[str(sid)] = gsis.strip()
-    log(f"  mapped {len(mapping)} Sleeper players to NFL IDs")
+            with_gsis += 1
+    log(f"  {len(mapping)} Sleeper players ({with_gsis} carry an NFL ID)")
     _SLEEPER_MAP_CACHE = mapping
     return mapping
 
 
-def fetch_projections(week, scoring_field):
-    """Return {gsis_id: projected_points}, or {} if unavailable."""
+def fetch_projections(week, scoring_field, players):
+    """
+    Return {our_player_id: projected_points}, or {} if unavailable.
+
+    Matching runs in three passes, most reliable first:
+      1. Sleeper's gsis_id, when present
+      2. normalized name + team
+      3. normalized name alone (covers recent trades, where the two
+         sources disagree on team)
+    Pass 3 is only safe because names are unique in our player pool;
+    the script checks that and skips the pass if they aren't.
+    """
     try:
-        sleeper_to_gsis = sleeper_player_map()
+        smap = sleeper_player_map()
+
+        by_gsis = {p["id"]: p["id"] for p in players}
+        by_name_team = {}
+        name_counts = {}
+        for p in players:
+            nn = norm_name(p["name"])
+            by_name_team[(nn, p["team"])] = p["id"]
+            name_counts[nn] = name_counts.get(nn, 0) + 1
+        by_name = {
+            norm_name(p["name"]): p["id"]
+            for p in players
+            if name_counts[norm_name(p["name"])] == 1
+        }
 
         log(f"Fetching Sleeper projections for week {week}...")
         r = requests.get(
@@ -213,8 +270,10 @@ def fetch_projections(week, scoring_field):
             rows = data
 
         out = {}
+        hits = {"gsis": 0, "name_team": 0, "name": 0}
         no_value = 0
-        unmapped = 0
+        unmatched = []
+
         for row in rows:
             if not isinstance(row, dict):
                 continue
@@ -223,23 +282,41 @@ def fetch_projections(week, scoring_field):
             val = stats.get(scoring_field)
             if val is None:
                 val = stats.get("pts_std")
-            gsis = sleeper_to_gsis.get(sid)
             if val is None:
                 no_value += 1
                 continue
-            if not gsis:
-                unmapped += 1
-                continue
             try:
-                out[gsis] = float(val)
+                val = float(val)
             except (TypeError, ValueError):
                 no_value += 1
+                continue
 
-        # Diagnostics: if the pick list looks short, these numbers say why.
-        log(f"  Sleeper returned {len(rows)} rows")
-        log(f"    {len(out)} usable projections")
-        log(f"    {no_value} rows had no '{scoring_field}' value")
-        log(f"    {unmapped} rows had no NFL ID to match on")
+            info = smap.get(sid) or {}
+            pid = None
+            if info.get("gsis") and info["gsis"] in by_gsis:
+                pid = by_gsis[info["gsis"]]
+                hits["gsis"] += 1
+            elif info.get("name"):
+                key = (info["name"], info.get("team") or "")
+                if key in by_name_team:
+                    pid = by_name_team[key]
+                    hits["name_team"] += 1
+                elif info["name"] in by_name:
+                    pid = by_name[info["name"]]
+                    hits["name"] += 1
+
+            if pid:
+                # Keep the best value if a player somehow appears twice.
+                if pid not in out or val > out[pid]:
+                    out[pid] = val
+            elif info.get("name"):
+                unmatched.append(f"{info['name']} ({info.get('team') or '?'})")
+
+        log(f"  {len(rows)} rows returned, {len(out)} matched to our players")
+        log(f"    by NFL ID: {hits['gsis']}, by name+team: {hits['name_team']}, by name: {hits['name']}")
+        log(f"    {no_value} rows had no projection value (expected — most players project zero)")
+        if unmatched:
+            log(f"    {len(unmatched)} projected players not in our pool, e.g. {', '.join(unmatched[:5])}")
         return out
 
     except Exception as e:
@@ -338,7 +415,7 @@ def main():
                 "half": "pts_half_ppr",
                 "standard": "pts_std",
             }.get(scoring_mode, "pts_std")
-            projections = fetch_projections(wk, field)
+            projections = fetch_projections(wk, field, players)
 
         for g in games:
             is_sunday = g["weekday"] == "Sunday"
