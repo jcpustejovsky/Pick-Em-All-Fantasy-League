@@ -206,6 +206,7 @@ def sleeper_player_map():
             "gsis": gsis or None,
             "name": norm_name(name),
             "team": norm_team((info.get("team") or "").strip().upper()),
+            "pos": (info.get("position") or "").strip().upper(),
         }
         if gsis:
             with_gsis += 1
@@ -218,13 +219,16 @@ def fetch_projections(week, scoring_field, players):
     """
     Return {our_player_id: projected_points}, or {} if unavailable.
 
-    Matching runs in three passes, most reliable first:
+    Matching runs in four passes, most reliable first:
       1. Sleeper's gsis_id, when present
       2. normalized name + team
       3. normalized name alone (covers recent trades, where the two
          sources disagree on team)
-    Pass 3 is only safe because names are unique in our player pool;
-    the script checks that and skips the pass if they aren't.
+      4. last name + team + position (covers nickname differences like
+         "Josh Palmer" vs "Joshua Palmer")
+    Passes 3 and 4 only accept a match when it is unambiguous in our
+    player pool — a shared key (Josh Allen / Kyle Allen) is skipped
+    rather than guessed at.
     """
     try:
         smap = sleeper_player_map()
@@ -232,15 +236,27 @@ def fetch_projections(week, scoring_field, players):
         by_gsis = {p["id"]: p["id"] for p in players}
         by_name_team = {}
         name_counts = {}
+        last_counts = {}
         for p in players:
             nn = norm_name(p.get("name"))
             by_name_team[(nn, p.get("team"))] = p["id"]
             name_counts[nn] = name_counts.get(nn, 0) + 1
+            if nn:
+                lk = (nn.split()[-1], p.get("team"), p.get("pos"))
+                last_counts[lk] = last_counts.get(lk, 0) + 1
         by_name = {
             norm_name(p["name"]): p["id"]
             for p in players
             if name_counts[norm_name(p["name"])] == 1
         }
+        by_last = {}
+        for p in players:
+            nn = norm_name(p.get("name"))
+            if not nn:
+                continue
+            lk = (nn.split()[-1], p.get("team"), p.get("pos"))
+            if last_counts[lk] == 1:
+                by_last[lk] = p["id"]
 
         log(f"Fetching Sleeper projections for week {week}...")
         r = requests.get(
@@ -271,7 +287,7 @@ def fetch_projections(week, scoring_field, players):
             rows = data
 
         out = {}
-        hits = {"gsis": 0, "name_team": 0, "name": 0}
+        hits = {"gsis": 0, "name_team": 0, "name": 0, "last": 0}
         no_value = 0
         unmatched = []
 
@@ -305,6 +321,15 @@ def fetch_projections(week, scoring_field, players):
                 elif info["name"] in by_name:
                     pid = by_name[info["name"]]
                     hits["name"] += 1
+                else:
+                    lk = (
+                        info["name"].split()[-1],
+                        info.get("team") or "",
+                        info.get("pos") or "",
+                    )
+                    if lk in by_last:
+                        pid = by_last[lk]
+                        hits["last"] += 1
 
             if pid:
                 # Keep the best value if a player somehow appears twice.
@@ -314,7 +339,8 @@ def fetch_projections(week, scoring_field, players):
                 unmatched.append(f"{info['name']} ({info.get('team') or '?'})")
 
         log(f"  {len(rows)} rows returned, {len(out)} matched to our players")
-        log(f"    by NFL ID: {hits['gsis']}, by name+team: {hits['name_team']}, by name: {hits['name']}")
+        log(f"    by NFL ID: {hits['gsis']}, by name+team: {hits['name_team']}, "
+            f"by name: {hits['name']}, by last name: {hits['last']}")
         log(f"    {no_value} rows had no projection value (expected — most players project zero)")
         if unmatched:
             log(f"    {len(unmatched)} projected players not in our pool, e.g. {', '.join(unmatched[:5])}")
