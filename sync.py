@@ -58,6 +58,40 @@ def fail(msg):
     sys.exit(1)
 
 
+def compute_current_week(sched, now=None):
+    """
+    The week the league should be on right now.
+
+    A week stays current until roughly 6 hours after its last game
+    kicks off (so Monday night finishing rolls it to the next week).
+    Before the season starts this returns week 1; after it ends, the
+    final week.
+    """
+    from datetime import timedelta
+
+    now = now or datetime.now(tz=ET)
+    last_kick = {}
+    for g in sched:
+        if not g["gameday"] or not g["gametime"]:
+            continue
+        try:
+            dt = datetime.strptime(
+                f"{g['gameday']} {g['gametime']}", "%Y-%m-%d %H:%M"
+            ).replace(tzinfo=ET)
+        except ValueError:
+            continue
+        wk = int(g["week"])
+        if wk not in last_kick or dt > last_kick[wk]:
+            last_kick[wk] = dt
+
+    if not last_kick:
+        return None
+    for wk in sorted(last_kick):
+        if last_kick[wk] + timedelta(hours=6) > now:
+            return wk
+    return max(last_kick)
+
+
 def norm_team(t):
     """nflverse uses LA for the Rams; the app uses LAR."""
     return "LAR" if t == "LA" else t
@@ -153,7 +187,14 @@ def fetch_projections(week, scoring_field):
         log(f"Fetching Sleeper projections for week {week}...")
         r = requests.get(
             SLEEPER_PROJECTIONS.format(season=SEASON, week=week),
-            params={"season_type": "regular"},
+            params=[
+                ("season_type", "regular"),
+                ("position[]", "QB"),
+                ("position[]", "RB"),
+                ("position[]", "WR"),
+                ("position[]", "TE"),
+                ("order_by", scoring_field),
+            ],
             timeout=120,
         )
         r.raise_for_status()
@@ -172,6 +213,8 @@ def fetch_projections(week, scoring_field):
             rows = data
 
         out = {}
+        no_value = 0
+        unmapped = 0
         for row in rows:
             if not isinstance(row, dict):
                 continue
@@ -181,12 +224,22 @@ def fetch_projections(week, scoring_field):
             if val is None:
                 val = stats.get("pts_std")
             gsis = sleeper_to_gsis.get(sid)
-            if gsis and val is not None:
-                try:
-                    out[gsis] = float(val)
-                except (TypeError, ValueError):
-                    pass
-        log(f"  got {len(out)} projections")
+            if val is None:
+                no_value += 1
+                continue
+            if not gsis:
+                unmapped += 1
+                continue
+            try:
+                out[gsis] = float(val)
+            except (TypeError, ValueError):
+                no_value += 1
+
+        # Diagnostics: if the pick list looks short, these numbers say why.
+        log(f"  Sleeper returned {len(rows)} rows")
+        log(f"    {len(out)} usable projections")
+        log(f"    {no_value} rows had no '{scoring_field}' value")
+        log(f"    {unmapped} rows had no NFL ID to match on")
         return out
 
     except Exception as e:
@@ -226,6 +279,24 @@ def main():
         if r["season"] == str(SEASON) and r["game_type"] == "REG"
     ]
     log(f"{len(sched)} regular season games for {SEASON}")
+
+    # Advance the league's current week automatically.
+    auto_week = compute_current_week(sched)
+    if auto_week and auto_week != current_week:
+        log(f"Advancing current week: {current_week} -> {auto_week}")
+        r = requests.patch(
+            f"{SUPABASE_URL}/rest/v1/league_meta",
+            headers=sb_headers({"Prefer": "return=minimal"}),
+            params={"id": "eq.1"},
+            json={"current_week": auto_week},
+            timeout=60,
+        )
+        if r.status_code >= 300:
+            log(f"WARNING: couldn't update current_week ({r.status_code}): {r.text[:300]}")
+        else:
+            current_week = auto_week
+    elif auto_week:
+        log(f"Current week is already {current_week}")
 
     weeks = sorted({int(r["week"]) for r in sched})
     week_rows = []
@@ -296,6 +367,38 @@ def main():
     sb_upsert("week_info", week_rows, "week")
     log("Writing weekly_players...")
     sb_upsert("weekly_players", weekly_player_rows, "player_id,week")
+
+    # ---------------- coverage report ----------------
+    # Does every Sunday team have a projected QB, RB, etc.? If the pick
+    # list looks short, this says whether data is missing or whether the
+    # pool is simply that size.
+    pos_by_id = {p["id"]: p["pos"] for p in players}
+    for wk in sorted({r["week"] for r in weekly_player_rows}):
+        rows_wk = [r for r in weekly_player_rows if r["week"] == wk and r["is_sunday"]]
+        if not rows_wk:
+            continue
+        teams_playing = len({
+            norm_team(g["home_team"]) for g in sched
+            if int(g["week"]) == wk and g["weekday"] == "Sunday"
+        } | {
+            norm_team(g["away_team"]) for g in sched
+            if int(g["week"]) == wk and g["weekday"] == "Sunday"
+        })
+        log(f"  Week {wk} coverage — {teams_playing} teams play Sunday:")
+        for pos in ("QB", "RB", "WR", "TE"):
+            in_pool = [r for r in rows_wk if pos_by_id.get(r["player_id"]) == pos]
+            with_proj = [r for r in in_pool if r["projected_points"] is not None]
+            teams_with_any = len({
+                p["team"] for p in players
+                if p["pos"] == pos and any(
+                    r["player_id"] == p["id"] for r in with_proj
+                )
+            })
+            flag = ""
+            if pos == "QB" and teams_with_any < teams_playing:
+                flag = f"  <-- only {teams_with_any}/{teams_playing} teams have a projected QB"
+            log(f"    {pos}: {len(in_pool)} in pool, {len(with_proj)} projected,"
+                f" covering {teams_with_any}/{teams_playing} teams{flag}")
 
     # ---------------- actual results ----------------
     log("Downloading stats...")
