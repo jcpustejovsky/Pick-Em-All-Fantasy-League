@@ -29,10 +29,35 @@
 // ====================================================================
 // CONFIG — from Supabase: Project Settings > API
 // ====================================================================
-const SUPABASE_URL = "YOUR_SUPABASE_PROJECT_URL";
-const SUPABASE_ANON_KEY = "YOUR_SUPABASE_ANON_KEY";
+const SUPABASE_URL = "https://kofzybyyyasjakvioena.supabase.co";
+const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtvZnp5Ynl5eWFzamFrdmlvZW5hIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODkwNzU1MTcsImV4cCI6MjEwNDY1MTUxN30.9V0cyPf22JUaQVwz6OYrGRzDp9uS1iM2lfGeGnNMxzU";
 
-const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+// Show a real message instead of hanging on "Loading…" forever.
+function fatal(title, detail) {
+  document.getElementById("app").innerHTML = `
+    <div class="max-w-lg mx-auto p-6">
+      <div class="bg-chalk border border-line rounded-lg p-5">
+        <div class="text-brick font-bold mb-2">${title}</div>
+        <div class="text-sm text-gray-700 whitespace-pre-line">${detail}</div>
+      </div>
+    </div>`;
+}
+
+let sb;
+try {
+  if (SUPABASE_URL.startsWith("YOUR_") || SUPABASE_ANON_KEY.startsWith("YOUR_")) {
+    throw new Error(
+      "The Supabase URL and anon key are still placeholders.\n\n" +
+      "Open index.html, find SUPABASE_URL and SUPABASE_ANON_KEY near the top " +
+      "of the script, and paste in the values from Supabase > Project Settings > API " +
+      "(Project URL, and the 'anon public' key). Then commit and push."
+    );
+  }
+  sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+} catch (e) {
+  fatal("This app isn't configured yet", e.message);
+  throw e;
+}
 
 // Roster: 8 players, all of them score. No bench.
 const SLOTS = [
@@ -704,8 +729,18 @@ document.body.addEventListener("change", (e) => {
 // ====================================================================
 // INIT
 // ====================================================================
-loadPublicInfo();
-refreshSession();
+(async () => {
+  try {
+    await loadPublicInfo();
+    await refreshSession();
+  } catch (e) {
+    console.error(e);
+    fatal("Couldn't reach the league database", 
+      (e && e.message ? e.message : String(e)) +
+      "\n\nCheck that the Supabase URL and anon key in index.html are correct, " +
+      "and that the Supabase project is running.");
+  }
+})();
 </script>
 </body>
 </html>
