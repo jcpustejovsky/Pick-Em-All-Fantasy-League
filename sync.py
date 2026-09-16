@@ -31,6 +31,7 @@ import io
 import os
 import re
 import sys
+import traceback
 import unicodedata
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -232,8 +233,8 @@ def fetch_projections(week, scoring_field, players):
         by_name_team = {}
         name_counts = {}
         for p in players:
-            nn = norm_name(p["name"])
-            by_name_team[(nn, p["team"])] = p["id"]
+            nn = norm_name(p.get("name"))
+            by_name_team[(nn, p.get("team"))] = p["id"]
             name_counts[nn] = name_counts.get(nn, 0) + 1
         by_name = {
             norm_name(p["name"]): p["id"]
@@ -319,10 +320,18 @@ def fetch_projections(week, scoring_field, players):
             log(f"    {len(unmatched)} projected players not in our pool, e.g. {', '.join(unmatched[:5])}")
         return out
 
+    except requests.RequestException as e:
+        log(f"WARNING: Sleeper unreachable ({type(e).__name__}: {e}).")
+        log("         Continuing without projections - the pick list will fall")
+        log("         back to alphabetical order. Nothing else is affected.")
+        return {}
     except Exception as e:
-        log(f"WARNING: projections unavailable ({type(e).__name__}: {e}).")
-        log("         Continuing without them - the pick list will fall back")
-        log("         to alphabetical order. Nothing else is affected.")
+        # A failure here is a bug in this script, not a data-source
+        # problem. Say so loudly rather than blaming Sleeper.
+        log(f"BUG in fetch_projections ({type(e).__name__}: {e}):")
+        for line in traceback.format_exc().splitlines():
+            log("    " + line)
+        log("    Projections skipped for this week. This needs a code fix.")
         return {}
 
 
@@ -341,7 +350,7 @@ def main():
     scoring_mode = (meta.get("scoring_mode") or "standard").lower()
     log(f"League: week {current_week}, scoring '{scoring_mode}'")
 
-    players = sb_select("players", {"select": "id,team,pos"})
+    players = sb_select("players", {"select": "id,name,team,pos"})
     if not players:
         fail("players table is empty - import the player CSV first.")
     by_team = {}
