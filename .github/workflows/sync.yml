@@ -1,0 +1,31 @@
+name: Sync NFL data
+
+on:
+  schedule:
+    # Times are UTC. GitHub's scheduler is best-effort and can run late
+    # when their infrastructure is busy, so these are deliberately not
+    # scheduled tight against kickoff.
+    - cron: "0 9 * * *"    # daily 9:00 UTC (~4am ET) - refresh projections
+    - cron: "0 6 * * 1"    # Monday 6:00 UTC (~1am ET) - Sunday results
+    - cron: "0 12 * * 2"   # Tuesday 12:00 UTC - catch late stat corrections
+  workflow_dispatch:        # lets you run it manually from the Actions tab
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run sync
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          SEASON: "2026"
+        run: python sync.py
