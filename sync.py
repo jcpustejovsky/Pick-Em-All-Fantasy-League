@@ -45,6 +45,7 @@ SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 NFLVERSE = "https://github.com/nflverse/nflverse-data/releases/download"
 SCHEDULE_URL = f"{NFLVERSE}/schedules/games.csv"
 STATS_URL = f"{NFLVERSE}/stats_player/stats_player_week_{SEASON}.csv"
+ROSTER_URL = f"{NFLVERSE}/players/players.csv"
 
 SLEEPER_PLAYERS = "https://api.sleeper.app/v1/players/nfl"
 SLEEPER_PROJECTIONS = "https://api.sleeper.com/projections/nfl/{season}/{week}"
@@ -65,15 +66,23 @@ def compute_current_week(sched, now=None):
     """
     The week the league should be on right now.
 
-    A week stays current until roughly 6 hours after its last game
-    kicks off (so Monday night finishing rolls it to the next week).
+    This league only counts Sunday games, so a week is over when its
+    last SUNDAY game is done - not when Monday night finishes. A week
+    stays current until roughly 6 hours after its last Sunday kickoff,
+    which lands around 2:20 AM ET Monday for a normal 8:20 PM Sunday
+    night game. The Monday morning sync then rolls everyone forward.
+
+    Weeks with no Sunday game at all fall back to the last game of
+    that week.
+
     Before the season starts this returns week 1; after it ends, the
     final week.
     """
     from datetime import timedelta
 
     now = now or datetime.now(tz=ET)
-    last_kick = {}
+    last_sunday = {}
+    last_any = {}
     for g in sched:
         if not g["gameday"] or not g["gametime"]:
             continue
@@ -84,20 +93,99 @@ def compute_current_week(sched, now=None):
         except ValueError:
             continue
         wk = int(g["week"])
-        if wk not in last_kick or dt > last_kick[wk]:
-            last_kick[wk] = dt
+        if wk not in last_any or dt > last_any[wk]:
+            last_any[wk] = dt
+        if g["weekday"] == "Sunday":
+            if wk not in last_sunday or dt > last_sunday[wk]:
+                last_sunday[wk] = dt
 
-    if not last_kick:
+    if not last_any:
         return None
-    for wk in sorted(last_kick):
-        if last_kick[wk] + timedelta(hours=6) > now:
+    for wk in sorted(last_any):
+        end = last_sunday.get(wk) or last_any[wk]
+        if end + timedelta(hours=6) > now:
             return wk
-    return max(last_kick)
+    return max(last_any)
 
 
 def norm_team(t):
     """nflverse uses LA for the Rams; the app uses LAR."""
     return "LAR" if t == "LA" else t
+
+
+POOL_POSITIONS = ("QB", "RB", "WR", "TE")
+
+
+def refresh_players(existing):
+    """
+    Pull the current active roster from nflverse and upsert it into the
+    players table. Returns the list of players who are active RIGHT NOW
+    (id, name, pos, team).
+
+    Nothing is ever deleted. A player who is cut keeps his row, so past
+    picks and past scores still resolve to a name. He simply stops
+    appearing in the pick list, because weekly_players rows are built
+    from the active list rather than from the whole table.
+
+    Returns None if the roster file can't be fetched, in which case the
+    caller carries on with whatever is already in the database.
+    """
+    try:
+        r = requests.get(ROSTER_URL, timeout=180)
+        r.raise_for_status()
+    except requests.RequestException as e:
+        log(f"WARNING: roster file unavailable ({type(e).__name__}: {e}).")
+        log("         Using the players already in the database.")
+        return None
+
+    rows = list(csv.DictReader(io.StringIO(r.text)))
+    active, seen = [], set()
+    for row in rows:
+        if row.get("last_season") != str(SEASON):
+            continue
+        if row.get("status") != "ACT":
+            continue
+        if row.get("position") not in POOL_POSITIONS:
+            continue
+        pid = (row.get("gsis_id") or "").strip()
+        if not pid or pid in seen:
+            continue
+        seen.add(pid)
+        active.append({
+            "id": pid,
+            "name": row.get("display_name") or "",
+            "pos": row.get("position"),
+            "team": norm_team((row.get("latest_team") or "").strip()),
+        })
+
+    if not active:
+        log("WARNING: roster file parsed but produced no active players.")
+        log("         Using the players already in the database.")
+        return None
+
+    before = {p["id"]: p for p in existing}
+    added = [p for p in active if p["id"] not in before]
+    moved = [
+        (before[p["id"]], p) for p in active
+        if p["id"] in before and before[p["id"]].get("team") != p["team"]
+    ]
+    dropped = [p for p in existing if p["id"] not in seen]
+
+    log(f"Roster: {len(active)} active players "
+        f"({len(added)} new, {len(moved)} changed team, {len(dropped)} no longer active)")
+    for p in added[:10]:
+        log(f"    + {p['name']} ({p['pos']}, {p['team']})")
+    for old, new in moved[:10]:
+        log(f"    ~ {new['name']}: {old.get('team')} -> {new['team']}")
+    for p in dropped[:10]:
+        log(f"    - {p.get('name')} ({p.get('team')}) - kept for history, hidden from picks")
+
+    if added or moved:
+        sb_upsert("players", active, "id")
+    else:
+        log("  no roster changes to write")
+
+    return active
 
 
 # ----------------------------------------------------------------
@@ -376,14 +464,24 @@ def main():
     scoring_mode = (meta.get("scoring_mode") or "standard").lower()
     log(f"League: week {current_week}, scoring '{scoring_mode}'")
 
+    existing = sb_select("players", {"select": "id,name,team,pos"})
+    active = refresh_players(existing)
+
+    # Everything in the table, including players no longer active: used
+    # for matching historical stats so past weeks keep scoring.
     players = sb_select("players", {"select": "id,name,team,pos"})
     if not players:
-        fail("players table is empty - import the player CSV first.")
-    by_team = {}
-    for p in players:
-        by_team.setdefault(p["team"], []).append(p)
+        fail("players table is empty and the roster refresh failed.")
     known_ids = {p["id"] for p in players}
-    log(f"{len(players)} players across {len(by_team)} teams")
+
+    # Only currently-active players get weekly rows, so cut players drop
+    # out of the pick list on their own.
+    pool = active if active is not None else players
+    by_team = {}
+    for p in pool:
+        by_team.setdefault(p["team"], []).append(p)
+    log(f"{len(pool)} pickable players across {len(by_team)} teams "
+        f"({len(players)} total in table)")
 
     # ---------------- schedule ----------------
     sched = [
