@@ -536,9 +536,11 @@ def main():
             "sunday_games": len(sunday),
         })
 
-        # Only weeks near the present need per-player rows; syncing all 18
-        # every run would be a lot of writes for no benefit.
-        if not (current_week - 1 <= wk <= current_week + 2):
+        # Only the current week and the next few need per-player rows.
+        # Past weeks are deliberately left alone: their rows already
+        # exist, their opponents can't change, and rebuilding them would
+        # wipe the projections that were stored while they were live.
+        if not (current_week <= wk <= current_week + 2):
             continue
 
         projections = {}
