@@ -226,27 +226,59 @@ async function loadPublicInfo() {
   });
 }
 
+// Supabase returns at most 1000 rows per request and truncates SILENTLY -
+// no error, no warning. Several of these tables passed 1000 rows partway
+// through the season, which quietly hid players from pick lists and left
+// scores out of the standings. Everything that can grow must be paged.
+//
+// orderBy must be unique enough to give a stable sort, or rows can repeat
+// or go missing across page boundaries. For tables keyed on two columns,
+// both are listed.
+const PAGE_SIZE = 1000;
+
+async function fetchAll(table, orderBy) {
+  const cols = Array.isArray(orderBy) ? orderBy : [orderBy];
+  const out = [];
+  let from = 0;
+  for (;;) {
+    let q = sb.from(table).select("*");
+    for (const c of cols) q = q.order(c, { ascending: true });
+    const { data, error } = await q.range(from, from + PAGE_SIZE - 1);
+    if (error) throw error;
+    if (!data || data.length === 0) break;
+    out.push(...data);
+    if (data.length < PAGE_SIZE) break;
+    from += PAGE_SIZE;
+    // Safety valve: stop runaway paging rather than hang the browser.
+    if (from > 200000) {
+      console.warn(`fetchAll(${table}) stopped at ${out.length} rows`);
+      break;
+    }
+  }
+  return out;
+}
+
 async function loadAll() {
-  const [playersRes, profilesRes, metaRes, picksRes, pointsRes, weekRes, wpRes] =
+  const [players, profiles, metaRes, picksRows, pointsRows, weekInfo, weeklyPlayers] =
     await Promise.all([
-      sb.from("players").select("*"),
-      sb.from("profiles").select("*"),
+      fetchAll("players", "id"),
+      fetchAll("profiles", "id"),
       sb.from("league_meta").select("*").eq("id", 1).maybeSingle(),
-      sb.from("picks").select("*"),
-      sb.from("weekly_points").select("*"),
-      sb.from("week_info").select("*"),
-      sb.from("weekly_players").select("*"),
+      fetchAll("picks", ["week", "user_id", "player_id"]),
+      fetchAll("weekly_points", ["week", "player_id"]),
+      fetchAll("week_info", "week"),
+      fetchAll("weekly_players", ["week", "player_id"]),
     ]);
   const meta = metaRes.data || state.meta;
   setState({
-    players: playersRes.data || [],
-    profiles: profilesRes.data || [],
-    teamCount: (profilesRes.data && profilesRes.data.length) ?? state.teamCount,
+    players,
+    profiles,
+    teamCount: profiles.length ?? state.teamCount,
     meta,
-    picksRows: picksRes.data || [],
-    pointsRows: pointsRes.data || [],
-    weekInfo: weekRes.data || [],
-    weeklyPlayers: wpRes.data || [],
+    picksRows,
+    pointsRows,
+    weekInfo,
+    weeklyPlayers,
     viewWeek: state.viewWeek || meta.current_week || 1,
     rosterManagerId: state.rosterManagerId || (state.session && state.session.user.id),
   });
@@ -346,8 +378,8 @@ async function togglePick(playerId) {
       return;
     }
   }
-  const { data } = await sb.from("picks").select("*");
-  setState({ picksRows: data || [], busy: false });
+  const picksRows = await fetchAll("picks", ["week", "user_id", "player_id"]);
+  setState({ picksRows, busy: false });
 }
 
 async function commitMeta(field, value) {
@@ -362,8 +394,8 @@ async function commitPoints(week, playerId, value) {
   const points = value === "" ? 0 : parseFloat(value);
   if (isNaN(points)) return;
   await sb.from("weekly_points").upsert({ player_id: playerId, week, points });
-  const { data } = await sb.from("weekly_points").select("*");
-  setState({ pointsRows: data || [] });
+  const pointsRows = await fetchAll("weekly_points", ["week", "player_id"]);
+  setState({ pointsRows });
 }
 
 // ====================================================================
