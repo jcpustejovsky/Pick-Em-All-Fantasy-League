@@ -2,12 +2,11 @@ name: Sync NFL data
 
 on:
   schedule:
-    # Cron is UTC. ET times below assume EDT (UTC-4); after the November
-    # clock change they land an hour earlier in local terms, which is
-    # harmless here since nothing is tight against kickoff.
+    # Cron is UTC. ET times below assume EST (UTC-5); nothing here runs
+    # tight against kickoff, so the daylight-saving shift is harmless.
     #
     # Sunday's last game ends around 11:30 PM ET, and nflverse refreshes
-    # its stats nightly — but not at a time they publish, so rather than
+    # its stats nightly - but not at a time they publish, so rather than
     # aiming at one exact window these runs take several passes at it.
     # Every write is an upsert, so repeats cost nothing.
     - cron: "0 9 * * *"     # 5:00 AM ET daily  - projections, schedule, week rollover
@@ -15,6 +14,15 @@ on:
     - cron: "0 17 * * 1"    # 1:00 PM ET Monday - retry if the morning run was early
     - cron: "0 13 * * 2"    # 9:00 AM ET Tuesday - late stat corrections
   workflow_dispatch:         # manual run from the Actions tab
+    inputs:
+      test_keepalive:
+        description: "Force the keepalive commit now, to prove it works"
+        type: boolean
+        default: false
+
+# Needed so the keepalive step at the bottom can push its empty commit.
+permissions:
+  contents: write
 
 jobs:
   sync:
@@ -35,3 +43,38 @@ jobs:
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           SEASON: "2026"
         run: python sync.py
+
+      # GitHub automatically disables a scheduled workflow after 60 days
+      # with no repository activity. When that happens every sync stops
+      # SILENTLY - no error, no failed run; the league just quietly stops
+      # updating. An empty commit once the repo has been quiet for 50 days
+      # resets that clock, so this never needs remembering.
+      #
+      # Runs last, and continue-on-error, so a keepalive problem can never
+      # make a successful sync look broken. If it ever does fail, GitHub
+      # still sends its 60-day warning email as a backstop.
+      #
+      # Normally this path only fires after 50 quiet days, which would make
+      # it untestable until the day it matters. Run the workflow manually
+      # with "Force the keepalive commit" ticked to exercise it on demand.
+      - name: Keep the schedule alive
+        continue-on-error: true
+        env:
+          FORCE: ${{ inputs.test_keepalive }}
+        run: |
+          LAST=$(git log -1 --format=%ct)
+          NOW=$(date +%s)
+          DAYS=$(( (NOW - LAST) / 86400 ))
+          echo "Last commit: $DAYS days ago (GitHub disables scheduled runs at 60)."
+          if [ "$DAYS" -ge 50 ] || [ "$FORCE" = "true" ]; then
+            if [ "$FORCE" = "true" ]; then
+              echo "Forced by hand - testing that the push actually works."
+            fi
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "chore: keep scheduled workflow alive"
+            git push
+            echo "Pushed an empty commit. Inactivity timer reset."
+          else
+            echo "No action needed - fires once the repo has been quiet for 50 days."
+          fi
